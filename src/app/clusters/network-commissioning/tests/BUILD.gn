@@ -28,7 +28,12 @@ chip_test_suite("tests") {
     "TestWifiResponse.cpp",
   ]
 
-  sources = [ "FakeDrivers.h" ]
+  sources = [
+    "FakeDrivers.h",
+    "FakeEthernetDriver.cpp",
+    "FakeThreadDriver.cpp",
+    "FakeWifiDriver.cpp",
+  ]
 
   cflags = [ "-Wconversion" ]
 

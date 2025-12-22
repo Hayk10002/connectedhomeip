@@ -374,7 +374,7 @@ public:
      *
      *    - Bit 0 = (WiFiBandEnum::k2g4 == 0) --> (1 << 0) == (1 << WiFiBandEnum::k2g4)
      *    - Bit 2 = (WiFiBandEnum::k5g == 2) --> (1 << 2) == (1 << WiFiBandEnum::k5g)
-     *    - If both 2.4G and 5G are supported --> ((1 << k2g4) || (1 << k5g)) == (1 || 4) == 5
+     *    - If both 2.4G and 5G are supported --> ((1 << k2g4) | (1 << k5g)) == (1 | 4) == 5
      *
      *  On error, return 0 (no bands supported). This should never happen... Note that
      *  certification tests will REQUIRE at least one bit set in the set.

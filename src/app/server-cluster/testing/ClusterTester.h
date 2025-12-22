@@ -172,8 +172,11 @@ public:
     template <typename ResponseType>
     struct InvokeResult
     {
-        std::optional<app::DataModel::ActionReturnStatus> status;
-        std::optional<ResponseType> response;
+        std::optional<app::DataModel::ActionReturnStatus> status{};
+        std::optional<ResponseType> response{};
+        MockCommandHandler& commandHandler;
+
+        InvokeResult(MockCommandHandler& handler): commandHandler(handler) {}
 
         // Returns true if the command was successful and response is available
         bool IsSuccess() const
@@ -183,17 +186,70 @@ public:
             else
                 return status.has_value() && status->IsSuccess() && response.has_value();
         }
+
+        // If the command is being handled asynchronously, this function should be called when the result is already expected to be available.
+        // If the command is being handled synchronously, this function should and will be called right after the `ClusterTester::Invoke` call.
+        void HandleCommandResponse()
+        {
+            // If InvokeCommand returned nullopt, it means the command implementation handled the response.
+            // We need to check the mock handler for a data response or a status response.
+            if (!status.has_value())
+            {
+                if (commandHandler.HasResponse())
+                {
+                    // A data response was added, so the command is successful.
+                    status = app::DataModel::ActionReturnStatus(CHIP_NO_ERROR);
+                }
+                else if (commandHandler.HasStatus())
+                {
+                    // A status response was added. Use the last one.
+                    status = app::DataModel::ActionReturnStatus(commandHandler.GetLastStatus().status);
+                }
+                else
+                {
+                    // Neither response nor status was provided; this is unexpected.
+                    // This would happen either in error (as mentioned here) or if the command is supposed
+                    // to be handled asynchronously. ClusterTester does not support such asynchronous processing.
+                    status = app::DataModel::ActionReturnStatus(CHIP_ERROR_INCORRECT_STATE);
+                    ChipLogError(
+                        Test, "InvokeCommand returned nullopt, but neither HasResponse nor HasStatus is true. Setting error status.");
+                }
+            }
+
+            // If command was successful and there's a response, decode it (skip for NullObjectType)
+            if constexpr (!std::is_same_v<ResponseType, app::DataModel::NullObjectType>)
+            {
+                if (status.has_value() && status->IsSuccess() && commandHandler.HasResponse())
+                {
+                    ResponseType decodedResponse;
+                    CHIP_ERROR decodeError = commandHandler.DecodeResponse(decodedResponse);
+                    if (decodeError == CHIP_NO_ERROR)
+                    {
+                        response = std::move(decodedResponse);
+                    }
+                    else
+                    {
+                        // Decode failed; reflect error in status and log
+                        status = app::DataModel::ActionReturnStatus(decodeError);
+                        ChipLogError(Test, "DecodeResponse failed: %s", decodeError.AsString());
+                    }
+                }
+            }
+        }
     };
 
     // Invoke a command and return the decoded result.
+    // Only the latest invoke operation (async or not) is valid. And the results may invalidate after a new invoke operation is started.
+    // If the command is expected to be handled asynchronously, `Invoke` should be called with `async = true`, and after calling this, `InvokeResult::HandleCommandResponse` should be called on the result when it is expected that the response is ready.
+    // On the synchronous case, this will be done automatically
     // The `request` parameter must be of the correct type for the command being invoked.
     // Use `app::Clusters::<ClusterName>::Commands::<CommandName>::Type` for the `request` parameter to be spec compliant
     // Will construct the command path using the first path returned by `GetPaths()` on the cluster.
     // @returns `CHIP_ERROR_INCORRECT_STATE` if `GetPaths()` doesn't return a list with one path.
     template <typename RequestType, typename ResponseType = typename RequestType::ResponseType>
-    [[nodiscard]] InvokeResult<ResponseType> Invoke(chip::CommandId commandId, const RequestType & request)
+    [[nodiscard]] InvokeResult<ResponseType> Invoke(chip::CommandId commandId, const RequestType & request, bool async = false)
     {
-        InvokeResult<ResponseType> result;
+        InvokeResult<ResponseType> result(mHandler);
 
         const auto & paths = mCluster.GetPaths();
         VerifyOrReturnValue(paths.size() == 1u, result);
@@ -216,59 +272,16 @@ public:
 
         result.status = mCluster.InvokeCommand(invokeRequest, reader, &mHandler);
 
-        // If InvokeCommand returned nullopt, it means the command implementation handled the response.
-        // We need to check the mock handler for a data response or a status response.
-        if (!result.status.has_value())
-        {
-            if (mHandler.HasResponse())
-            {
-                // A data response was added, so the command is successful.
-                result.status = app::DataModel::ActionReturnStatus(CHIP_NO_ERROR);
-            }
-            else if (mHandler.HasStatus())
-            {
-                // A status response was added. Use the last one.
-                result.status = app::DataModel::ActionReturnStatus(mHandler.GetLastStatus().status);
-            }
-            else
-            {
-                // Neither response nor status was provided; this is unexpected.
-                // This would happen either in error (as mentioned here) or if the command is supposed
-                // to be handled asynchronously. ClusterTester does not support such asynchronous processing.
-                result.status = app::DataModel::ActionReturnStatus(CHIP_ERROR_INCORRECT_STATE);
-                ChipLogError(
-                    Test, "InvokeCommand returned nullopt, but neither HasResponse nor HasStatus is true. Setting error status.");
-            }
-        }
-
-        // If command was successful and there's a response, decode it (skip for NullObjectType)
-        if constexpr (!std::is_same_v<ResponseType, app::DataModel::NullObjectType>)
-        {
-            if (result.status.has_value() && result.status->IsSuccess() && mHandler.HasResponse())
-            {
-                ResponseType decodedResponse;
-                CHIP_ERROR decodeError = mHandler.DecodeResponse(decodedResponse);
-                if (decodeError == CHIP_NO_ERROR)
-                {
-                    result.response = std::move(decodedResponse);
-                }
-                else
-                {
-                    // Decode failed; reflect error in status and log
-                    result.status = app::DataModel::ActionReturnStatus(decodeError);
-                    ChipLogError(Test, "DecodeResponse failed: %s", decodeError.AsString());
-                }
-            }
-        }
+        if (!async) { result.HandleCommandResponse(); }
 
         return result;
     }
 
     // convenience method: most requests have a `GetCommandId` (and GetClusterId() as well).
     template <typename RequestType, typename ResponseType = typename RequestType::ResponseType>
-    [[nodiscard]] InvokeResult<ResponseType> Invoke(const RequestType & request)
+    [[nodiscard]] InvokeResult<ResponseType> Invoke(const RequestType & request, bool async = false)
     {
-        return Invoke(RequestType::GetCommandId(), request);
+        return Invoke(RequestType::GetCommandId(), request, async);
     }
 
     // Returns the next generated event from the event generator in the test server cluster context
@@ -304,7 +317,7 @@ private:
     // If protocol or test requirements change, this value may need to be increased.
     static constexpr size_t kTlvBufferSize = 256;
 
-    chip::Testing::MockCommandHandler mHandler;
+    MockCommandHandler mHandler;
     uint8_t mTlvBuffer[kTlvBufferSize];
     std::vector<std::unique_ptr<ReadOperation>> mReadOperations;
 

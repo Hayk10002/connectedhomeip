@@ -188,7 +188,7 @@ bool LinuxThreadDriver::ThreadNetworkIterator::Next(Network & item)
     // The Thread network is not actually enabled.
     VerifyOrReturnError(ConnectivityMgrImpl().IsThreadAttached(), true);
     VerifyOrReturnError(ThreadStackMgrImpl().GetThreadProvision(currentDataset) == CHIP_NO_ERROR, true);
-    // The Thread network is not enabled, but has a different extended pan id.
+    // The Thread network is enabled, but has a different extended pan id.
     VerifyOrReturnError(currentDataset.GetExtendedPanId(enabledExtPanId) == CHIP_NO_ERROR, true);
     VerifyOrReturnError(memcmp(extpanid, enabledExtPanId, kSizeExtendedPanId) == 0, true);
     // The Thread network is enabled and has the same extended pan id as the one in our record.
