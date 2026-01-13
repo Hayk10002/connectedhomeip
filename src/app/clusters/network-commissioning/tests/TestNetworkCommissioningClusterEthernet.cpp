@@ -22,6 +22,7 @@
 #include <app/data-model-provider/MetadataTypes.h>
 #include <app/data-model-provider/tests/TestConstants.h>
 #include <app/data-model-provider/tests/WriteTesting.h>
+#include <app/server/Server.h>
 #include <app/server-cluster/DefaultServerCluster.h>
 #include <app/server-cluster/testing/AttributeTesting.h>
 #include <app/server-cluster/testing/ClusterTester.h>
@@ -33,9 +34,11 @@
 #include <clusters/NetworkCommissioning/Ids.h>
 #include <clusters/NetworkCommissioning/Metadata.h>
 #include <clusters/NetworkCommissioning/Structs.h>
+#include <credentials/tests/CHIPCert_test_vectors.h>
 #include <lib/core/CHIPError.h>
 #include <lib/core/DataModelTypes.h>
 #include <lib/support/ReadOnlyBuffer.h>
+#include <lib/support/ThreadOperationalDataset.h>
 #include <platform/NetworkCommissioning.h>
 
 #include "FakeDrivers.h"
@@ -51,6 +54,7 @@ using chip::app::ClusterShutdownType;
 using chip::app::DataModel::AttributeEntry;
 using chip::Testing::kAdminSubjectDescriptor;
 using chip::Testing::WriteOperation;
+using chip::Thread::OperationalDataset;
 
 class NoopBreadcrumbTracker : public BreadCrumbTracker
 {
@@ -63,11 +67,13 @@ struct TestNetworkCommissioningClusterEthernet : public ::testing::Test
     static void SetUpTestSuite()
     {
         ASSERT_EQ(chip::Platform::MemoryInit(), CHIP_NO_ERROR);
+        ASSERT_EQ(DeviceLayer::SystemLayer().Init(), CHIP_NO_ERROR);
         ASSERT_EQ(DeviceLayer::PlatformMgr().StartEventLoopTask(), CHIP_NO_ERROR);
     }
     static void TearDownTestSuite()
     {
         EXPECT_EQ(DeviceLayer::PlatformMgr().StopEventLoopTask(), CHIP_NO_ERROR);
+        DeviceLayer::SystemLayer().Shutdown();
         chip::Platform::MemoryShutdown();
     }
 
@@ -135,7 +141,6 @@ struct TestNetworkCommissioningClusterEthernet : public ::testing::Test
         // Attribute List
         if constexpr (is_ethernet)
         {
-            // Ethernet has no List attribute
             ASSERT_TRUE(Testing::IsAttributesListEqualTo(cluster,
                                                         {
                                                             Attributes::MaxNetworks::kMetadataEntry,
@@ -363,6 +368,345 @@ struct TestNetworkCommissioningClusterEthernet : public ::testing::Test
         cluster.Shutdown(ClusterShutdownType::kClusterShutdown);
         cluster.Deinit();
     }
+    template<class DriverT>
+    void TestCommands()
+    {
+        constexpr bool is_wifi = std::is_same_v<DriverT, Testing::FakeWiFiDriver>;
+        constexpr bool is_thread = std::is_same_v<DriverT, Testing::FakeThreadDriver>;
+        static_assert(is_wifi || is_thread, "DriverT must be one of FakeWifiDriver or FakeThreadDriver");
+
+        // this is done to be able to check for this without checking CHIP_DEVICE_CONFIG_ENABLE_WIFI_PDC
+        [[maybe_unused]] bool supportsPDC = false;
+#if CHIP_DEVICE_CONFIG_ENABLE_WIFI_PDC
+        if constexpr (is_wifi)
+        {
+            // enable PDC if the macro is set
+            fakeDriver.PDCEnabled = true;
+            supportsPDC = fakeDriver.SupportsPerDeviceCredentials();
+        }
+#endif
+
+        NoopBreadcrumbTracker tracker;
+        DriverT fakeDriver;
+        NetworkCommissioningCluster cluster(kRootEndpointId, &fakeDriver, tracker);
+        chip::Testing::ClusterTester tester(cluster);
+        ASSERT_EQ(cluster.Init(), CHIP_NO_ERROR);
+        ASSERT_EQ(cluster.Startup(tester.GetServerClusterContext()), CHIP_NO_ERROR);
+
+        // Scan Networks
+        {
+            auto response = tester.Invoke(Commands::ScanNetworks::Id, Commands::ScanNetworks::Type{}, true);
+
+            DeviceLayer::PlatformMgr().LockChipStack();
+            fakeDriver.FinaliseScanNetworks();
+            DeviceLayer::PlatformMgr().UnlockChipStack();
+
+            response.HandleCommandResponse();
+
+            ASSERT_TRUE(response.IsSuccess());
+            ASSERT_TRUE(response.response.has_value());
+            Commands::ScanNetworksResponse::DecodableType scanResponse = response.response.value(); // NOLINT(bugprone-unchecked-optional-access)
+            EXPECT_EQ(scanResponse.networkingStatus, NetworkCommissioningStatusEnum::kSuccess);
+            if constexpr (is_wifi)
+            {
+                ASSERT_TRUE(scanResponse.wiFiScanResults.HasValue());
+                EXPECT_FALSE(scanResponse.threadScanResults.HasValue());
+                auto & scanResults = scanResponse.wiFiScanResults.Value();
+                {
+                    auto it = scanResults.begin();
+
+                    ASSERT_TRUE(it.Next());
+                    const auto & sr1 = it.GetValue();
+                    EXPECT_TRUE(sr1.ssid.data_equal(ByteSpan(Uint8::from_const_char("First"), 5)));
+                    EXPECT_TRUE(sr1.bssid.data_equal(ByteSpan(Uint8::from_const_char("BSSID1"), 6)));
+
+                    ASSERT_TRUE(it.Next());
+                    const auto & sr2 = it.GetValue();
+                    EXPECT_TRUE(sr2.ssid.data_equal(ByteSpan(Uint8::from_const_char("Second"), 6)));
+                    EXPECT_TRUE(sr2.bssid.data_equal(ByteSpan(Uint8::from_const_char("BSSID2"), 6)));
+
+                    ASSERT_TRUE(it.Next());
+                    const auto & sr3 = it.GetValue();
+                    EXPECT_TRUE(sr3.ssid.data_equal(ByteSpan(Uint8::from_const_char("Third"), 5)));
+                    EXPECT_TRUE(sr3.bssid.data_equal(ByteSpan(Uint8::from_const_char("BSSID3"), 6)));
+
+                    ASSERT_TRUE(it.Next());
+                    const auto & sr4 = it.GetValue();
+                    EXPECT_TRUE(sr4.ssid.data_equal(ByteSpan(Uint8::from_const_char("Fourth"), 6)));
+                    EXPECT_TRUE(sr4.bssid.data_equal(ByteSpan(Uint8::from_const_char("BSSID4"), 6)));
+
+                    EXPECT_FALSE(it.Next());
+                    EXPECT_EQ(it.GetStatus(), CHIP_NO_ERROR);
+                }
+            }
+            else if constexpr (is_thread)
+            {
+                ASSERT_TRUE(scanResponse.threadScanResults.HasValue());
+                EXPECT_FALSE(scanResponse.wiFiScanResults.HasValue());
+                auto & scanResults = scanResponse.threadScanResults.Value();
+                {
+                    auto it = scanResults.begin();
+
+                    ASSERT_TRUE(it.Next());
+                    const auto & sr1 = it.GetValue();
+                    EXPECT_EQ(sr1.extendedPanId, 1234u);
+
+                    ASSERT_TRUE(it.Next());
+                    const auto & sr2 = it.GetValue();
+                    EXPECT_EQ(sr2.extendedPanId, 2345u);
+
+                    ASSERT_TRUE(it.Next());
+                    const auto & sr3 = it.GetValue();
+                    EXPECT_EQ(sr3.extendedPanId, 3456u);
+
+                    ASSERT_TRUE(it.Next());
+                    const auto & sr4 = it.GetValue();
+                    EXPECT_EQ(sr4.extendedPanId, 4567u);
+
+                    EXPECT_FALSE(it.Next());
+                    EXPECT_EQ(it.GetStatus(), CHIP_NO_ERROR);
+                }
+            }
+        }
+
+        // Scan Networks with specific SSID (only for WiFi)
+        {
+            if constexpr (is_wifi)
+            {
+                Commands::ScanNetworks::Type request
+                {
+                    .ssid = MakeOptional(ByteSpan(Uint8::from_const_char("Third"), 5))
+                };
+                auto response = tester.Invoke(Commands::ScanNetworks::Id, request, true);
+
+                DeviceLayer::PlatformMgr().LockChipStack();
+                fakeDriver.FinaliseScanNetworks();
+                DeviceLayer::PlatformMgr().UnlockChipStack();
+
+                response.HandleCommandResponse();
+
+                ASSERT_TRUE(response.IsSuccess());
+                ASSERT_TRUE(response.response.has_value());
+                Commands::ScanNetworksResponse::DecodableType scanResponse = response.response.value(); // NOLINT(bugprone-unchecked-optional-access)
+                EXPECT_EQ(scanResponse.networkingStatus, NetworkCommissioningStatusEnum::kSuccess);
+                ASSERT_TRUE(scanResponse.wiFiScanResults.HasValue());
+                auto & scanResults = scanResponse.wiFiScanResults.Value();
+                {
+                    auto it = scanResults.begin();
+                    ASSERT_TRUE(it.Next());
+                    const auto & sr = it.GetValue();
+                    EXPECT_TRUE(sr.ssid.data_equal(ByteSpan(Uint8::from_const_char("Third"), 5)));
+                    EXPECT_TRUE(sr.bssid.data_equal(ByteSpan(Uint8::from_const_char("BSSID3"), 6)));
+
+                    EXPECT_FALSE(it.Next());
+                    EXPECT_EQ(it.GetStatus(), CHIP_NO_ERROR);
+                }
+            }
+        }
+
+        //Scan Networks fail
+        {
+            auto response = tester.Invoke(Commands::ScanNetworks::Id, Commands::ScanNetworks::Type{}, true);
+
+            DeviceLayer::PlatformMgr().LockChipStack();
+            fakeDriver.FinaliseScanNetworks(false);
+            DeviceLayer::PlatformMgr().UnlockChipStack();
+
+            response.HandleCommandResponse();
+
+            ASSERT_TRUE(response.IsSuccess());
+            ASSERT_TRUE(response.response.has_value());
+            Commands::ScanNetworksResponse::DecodableType scanResponse = response.response.value(); // NOLINT(bugprone-unchecked-optional-access)
+            EXPECT_EQ(scanResponse.networkingStatus, NetworkCommissioningStatusEnum::kUnknownError);
+            ASSERT_TRUE(scanResponse.debugText.HasValue());
+            EXPECT_TRUE(scanResponse.debugText.Value().data_equal("Scan/Failure"_span));
+        }
+
+        // AddOrUpdateNetwork without failsafe
+        {
+            if constexpr (is_wifi)
+            {
+                Commands::AddOrUpdateWiFiNetwork::Type request
+                {
+                    .ssid = ByteSpan(Uint8::from_const_char("FailSafeTest"), 12),
+                    .credentials = ByteSpan(),
+                };
+
+                auto response = tester.Invoke(Commands::AddOrUpdateWiFiNetwork::Id, request);
+                ASSERT_FALSE(response.IsSuccess());
+                ASSERT_TRUE(response.status.has_value());
+                EXPECT_EQ(response.status.value(), Protocols::InteractionModel::Status::FailsafeRequired);
+            }
+            else
+            {
+                OperationalDataset dataset;
+                static constexpr uint8_t kExtendedPanId[] = { 'F', 'a', 'i', 'l', 'S', 'a', 'f', 'e' };
+                ASSERT_EQ(dataset.SetExtendedPanId(kExtendedPanId), CHIP_NO_ERROR);
+                Commands::AddOrUpdateThreadNetwork::Type request
+                {
+                    .operationalDataset = dataset.AsByteSpan(),
+                };
+
+                auto response = tester.Invoke(Commands::AddOrUpdateThreadNetwork::Id, request);
+                ASSERT_FALSE(response.IsSuccess());
+                ASSERT_TRUE(response.status.has_value());
+                EXPECT_EQ(response.status.value(), Protocols::InteractionModel::Status::FailsafeRequired);
+            }
+        }
+
+        // Arm the failsaife
+        constexpr uint16_t kFailSafeTimeout = 20;
+
+        DeviceLayer::PlatformMgr().LockChipStack();
+        ASSERT_EQ(chip::Server::GetInstance().GetFailSafeContext().ArmFailSafe(chip::Testing::kTestFabricIndex, chip::System::Clock::Seconds16(kFailSafeTimeout)), CHIP_NO_ERROR);
+        DeviceLayer::PlatformMgr().UnlockChipStack();
+
+        // AddOrUpdateWifiNetwork
+        if constexpr (is_wifi)
+        {
+            // No networks in Networks attribute initially
+            {
+                Attributes::Networks::TypeInfo::DecodableType networks;
+                ASSERT_TRUE(tester.ReadAttribute(Attributes::Networks::Id, networks).IsSuccess());
+                auto it = networks.begin();
+                EXPECT_FALSE(it.Next());
+                EXPECT_EQ(it.GetStatus(), CHIP_NO_ERROR);
+            }
+
+            // Add an open network (no credentials, no NetworkIdentity)
+            {
+                Commands::AddOrUpdateWiFiNetwork::Type request
+                {
+                    .ssid = ByteSpan(Uint8::from_const_char("First"), 5),
+                    .credentials = ByteSpan(),
+                };
+
+                auto response = tester.Invoke(Commands::AddOrUpdateWiFiNetwork::Id, request);
+
+                ASSERT_TRUE(response.IsSuccess());
+                ASSERT_TRUE(response.response.has_value());
+                Commands::NetworkConfigResponse::DecodableType netResponse = response.response.value(); // NOLINT(bugprone-unchecked-optional-access)
+                EXPECT_EQ(netResponse.networkingStatus, NetworkCommissioningStatusEnum::kSuccess);
+                ASSERT_TRUE(netResponse.networkIndex.HasValue());
+                EXPECT_EQ(netResponse.networkIndex.Value(), 0u);
+            }
+
+            // Add a secured network (with credentials, no NetworkIdentity)
+            {
+                Commands::AddOrUpdateWiFiNetwork::Type request
+                {
+                    .ssid = ByteSpan(Uint8::from_const_char("Second"), 6),
+                    .credentials = ByteSpan(Uint8::from_const_char("password"), 8),
+                };
+
+                auto response = tester.Invoke(Commands::AddOrUpdateWiFiNetwork::Id, request);
+
+                ASSERT_TRUE(response.IsSuccess());
+                ASSERT_TRUE(response.response.has_value());
+                Commands::NetworkConfigResponse::DecodableType netResponse = response.response.value(); // NOLINT(bugprone-unchecked-optional-access)
+                EXPECT_EQ(netResponse.networkingStatus, NetworkCommissioningStatusEnum::kSuccess);
+                ASSERT_TRUE(netResponse.networkIndex.HasValue());
+                EXPECT_EQ(netResponse.networkIndex.Value(), 1u);
+            }
+
+            // If supported, Add a network with NetworkIdentity (PDC), else add another network with credentials only
+#if CHIP_DEVICE_CONFIG_ENABLE_WIFI_PDC
+            if (supportsPDC)
+            {
+                Commands::AddOrUpdateWiFiNetwork::Type request
+                {
+                    .ssid = ByteSpan(Uint8::from_const_char("Third"), 5),
+                    .credentials = ByteSpan(),
+                    .networkIdentity = MakeOptional(TestCerts::sTestCert_PDCID01_ChipCompact);
+                };
+
+                auto response = tester.Invoke(Commands::AddOrUpdateWiFiNetwork::Id, request);
+                ASSERT_TRUE(response.IsSuccess());
+                ASSERT_TRUE(response.response.has_value());
+                Commands::NetworkConfigResponse::DecodableType netResponse = response.response.value(); // NOLINT(bugprone-unchecked-optional-access)
+                EXPECT_EQ(netResponse.networkingStatus, NetworkCommissioningStatusEnum::kSuccess);
+                ASSERT_TRUE(netResponse.networkIndex.HasValue());
+                EXPECT_EQ(netResponse.networkIndex.Value(), 2u);
+                EXPECT_TRUE(netResponse.clientIdentity.HasValue());
+            }
+            else
+#endif
+            {
+                Commands::AddOrUpdateWiFiNetwork::Type request
+                {
+                    .ssid = ByteSpan(Uint8::from_const_char("Third"), 5),
+                    .credentials = ByteSpan(Uint8::from_const_char("password3"), 9),
+                };
+
+                auto response = tester.Invoke(Commands::AddOrUpdateWiFiNetwork::Id, request);
+                ASSERT_TRUE(response.IsSuccess());
+                ASSERT_TRUE(response.response.has_value());
+                Commands::NetworkConfigResponse::DecodableType netResponse = response.response.value(); // NOLINT(bugprone-unchecked-optional-access)
+                EXPECT_EQ(netResponse.networkingStatus, NetworkCommissioningStatusEnum::kSuccess);
+                ASSERT_TRUE(netResponse.networkIndex.HasValue());
+                EXPECT_EQ(netResponse.networkIndex.Value(), 2u);
+            }
+
+            // Networks attribute should now have 3 networks (this is max for FakeWiFiDriver)
+            {
+                Attributes::Networks::TypeInfo::DecodableType networks;
+                ASSERT_TRUE(tester.ReadAttribute(Attributes::Networks::Id, networks).IsSuccess());
+                auto it = networks.begin();
+
+                ASSERT_TRUE(it.Next());
+                const auto & net1 = it.GetValue();
+                EXPECT_TRUE(net1.networkID.data_equal(ByteSpan(Uint8::from_const_char("First"), 5)));
+
+                ASSERT_TRUE(it.Next());
+                const auto & net2 = it.GetValue();
+                EXPECT_TRUE(net2.networkID.data_equal(ByteSpan(Uint8::from_const_char("Second"), 6)));
+
+                ASSERT_TRUE(it.Next());
+                const auto & net3 = it.GetValue();
+                EXPECT_TRUE(net3.networkID.data_equal(ByteSpan(Uint8::from_const_char("Third"), 5)));
+
+                EXPECT_FALSE(it.Next());
+                EXPECT_EQ(it.GetStatus(), CHIP_NO_ERROR);
+            }
+
+            // Try to Add a new network - should fail
+            {
+                Commands::AddOrUpdateWiFiNetwork::Type request
+                {
+                    .ssid = ByteSpan(Uint8::from_const_char("Fourth"), 6),
+                    .credentials = ByteSpan(),
+                };
+
+                auto response = tester.Invoke(Commands::AddOrUpdateWiFiNetwork::Id, request);
+
+                ASSERT_TRUE(response.IsSuccess());
+                ASSERT_TRUE(response.response.has_value());
+                Commands::NetworkConfigResponse::DecodableType netResponse = response.response.value(); // NOLINT(bugprone-unchecked-optional-access)
+                EXPECT_EQ(netResponse.networkingStatus, NetworkCommissioningStatusEnum::kBoundsExceeded);
+            }
+
+            // Update an the password of the second network
+            {
+                Commands::AddOrUpdateWiFiNetwork::Type request
+                {
+                    .ssid = ByteSpan(Uint8::from_const_char("Second"), 6),
+                    .credentials = ByteSpan(Uint8::from_const_char("new_password"), 12),
+                };
+
+                auto response = tester.Invoke(Commands::AddOrUpdateWiFiNetwork::Id, request);
+
+                ASSERT_TRUE(response.IsSuccess());
+                ASSERT_TRUE(response.response.has_value());
+                Commands::NetworkConfigResponse::DecodableType netResponse = response.response.value(); // NOLINT(bugprone-unchecked-optional-access)
+                EXPECT_EQ(netResponse.networkingStatus, NetworkCommissioningStatusEnum::kSuccess);
+                ASSERT_TRUE(netResponse.networkIndex.HasValue());
+                EXPECT_EQ(netResponse.networkIndex.Value(), 1u);
+            }
+        }
+
+        cluster.Shutdown(ClusterShutdownType::kClusterShutdown);
+        cluster.Deinit();
+    }
 };
 
 TEST_F(TestNetworkCommissioningClusterEthernet, TestAttributes)
@@ -370,8 +714,15 @@ TEST_F(TestNetworkCommissioningClusterEthernet, TestAttributes)
     TestAttributes<Testing::FakeEthernetDriver>();
     TestAttributes<Testing::FakeWiFiDriver>();
     TestAttributes<Testing::FakeThreadDriver>();
+}
 
-    EXPECT_FALSE(HasFailure());
+TEST_F(TestNetworkCommissioningClusterEthernet, TestCommands)
+{
+    TestCommands<Testing::FakeWiFiDriver>();
+    ASSERT_FALSE(HasFailure());
+
+    TestCommands<Testing::FakeThreadDriver>();
+    ASSERT_FALSE(HasFailure());
 }
 
 } // namespace

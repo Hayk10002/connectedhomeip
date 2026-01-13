@@ -229,8 +229,8 @@ void FakeWiFiDriver::FinaliseScanNetworks(bool success)
     memcpy(scanResults[2].ssid, Uint8::from_const_char("Third"), 5);
     memcpy(scanResults[2].bssid, Uint8::from_const_char("BSSID3"), 6);
 
-    scanResults[3].ssidLen = 5;
-    memcpy(scanResults[3].ssid, Uint8::from_const_char("Forth"), 5);
+    scanResults[3].ssidLen = 6;
+    memcpy(scanResults[3].ssid, Uint8::from_const_char("Fourth"), 6);
     memcpy(scanResults[3].bssid, Uint8::from_const_char("BSSID4"), 6);
 
     if (success)
